@@ -33,9 +33,37 @@ def _default_responder(messages: list[dict]) -> str:
     return "MOCK_RESPONSE"
 
 
-def _make_sse_response(text: str, msg_id: str = "msg_mock") -> list[dict]:
-    """Build the SSE event list for a streaming response."""
-    return [
+def _make_sse_response(
+    text: str, msg_id: str = "msg_mock", model: str = "claude-sonnet-4-6",
+) -> list[dict]:
+    """Build the SSE event list for a streaming text response."""
+    return _make_sse_message(
+        [{"type": "text", "text": text}],
+        stop_reason="end_turn",
+        msg_id=msg_id,
+        model=model,
+    )
+
+
+def _make_sse_tool_use(
+    tool_name: str, tool_input: dict, tool_id: str = "toolu_mock",
+    msg_id: str = "msg_mock", model: str = "claude-sonnet-4-6",
+) -> list[dict]:
+    """Build the SSE event list for a tool_use response."""
+    return _make_sse_message(
+        [{"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_input}],
+        stop_reason="tool_use",
+        msg_id=msg_id,
+        model=model,
+    )
+
+
+def _make_sse_message(
+    content_blocks: list[dict], stop_reason: str, msg_id: str = "msg_mock",
+    model: str = "claude-sonnet-4-6",
+) -> list[dict]:
+    """Build SSE event list for a streaming response with arbitrary content blocks."""
+    events = [
         {
             "type": "message_start",
             "message": {
@@ -43,7 +71,7 @@ def _make_sse_response(text: str, msg_id: str = "msg_mock") -> list[dict]:
                 "type": "message",
                 "role": "assistant",
                 "content": [],
-                "model": "claude-haiku-4-5-20251001",
+                "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
                 "usage": {
@@ -54,33 +82,57 @@ def _make_sse_response(text: str, msg_id: str = "msg_mock") -> list[dict]:
                 },
             },
         },
-        {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        },
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": text},
-        },
-        {"type": "content_block_stop", "index": 0},
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": len(text.split())},
-        },
-        {"type": "message_stop"},
     ]
+    for i, block in enumerate(content_blocks):
+        if block["type"] == "text":
+            events.append({
+                "type": "content_block_start",
+                "index": i,
+                "content_block": {"type": "text", "text": ""},
+            })
+            events.append({
+                "type": "content_block_delta",
+                "index": i,
+                "delta": {"type": "text_delta", "text": block["text"]},
+            })
+        elif block["type"] == "tool_use":
+            events.append({
+                "type": "content_block_start",
+                "index": i,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": block["id"],
+                    "name": block["name"],
+                    "input": {},
+                },
+            })
+            events.append({
+                "type": "content_block_delta",
+                "index": i,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(block["input"]),
+                },
+            })
+        events.append({"type": "content_block_stop", "index": i})
+
+    events.append({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": 10},
+    })
+    events.append({"type": "message_stop"})
+    return events
 
 
 class MockAPIServer:
     """Local mock of the Anthropic Messages API."""
 
-    def __init__(self, port: int = 0, responder=None):
+    def __init__(self, port: int = 0, responder=None, first_delay: float = 0):
         self.responder = responder or _default_responder
         self.requests: list[dict] = []
         self._port = port
+        self._first_delay = first_delay
         self._server = None
         self._thread = None
 
@@ -104,13 +156,21 @@ class MockAPIServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
+                import time as _time
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length)) if length else {}
                 parent.requests.append({"path": self.path, "body": body})
+                if parent._first_delay > 0 and len(parent.requests) <= 3:
+                    _time.sleep(parent._first_delay)
 
                 messages = body.get("messages", [])
-                text = parent.responder(messages)
-                events = _make_sse_response(text, f"msg_{len(parent.requests)}")
+                model = body.get("model", "claude-sonnet-4-6")
+                result = parent.responder(messages)
+                msg_id = f"msg_{len(parent.requests)}"
+                if isinstance(result, list):
+                    events = result  # Raw SSE events
+                else:
+                    events = _make_sse_response(result, msg_id, model=model)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
